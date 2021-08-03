@@ -1,4 +1,3 @@
-mod base58;
 #[allow(dead_code)]
 mod bech32;
 #[allow(dead_code)]

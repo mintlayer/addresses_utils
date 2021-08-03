@@ -1,5 +1,6 @@
 use crate::hashing::sha2_256;
-use bech32_no_std::u5;
+use base58::ToBase58;
+use bech32_no_std::{u5, ToBase32};
 use ripemd160::{Digest, Ripemd160};
 
 pub fn pubkey2addr(pubkey: [u8; 33]) -> Option<String> {
@@ -18,7 +19,7 @@ pub fn pubkey2addr(pubkey: [u8; 33]) -> Option<String> {
     let hash160 = hasher.finalize();
 
     // Generate an address
-    crate::base58::encode(&hash160[..], crate::base58::Base58Alphabets::Bitcoin)
+    Some(hash160.as_slice().to_base58())
 }
 
 #[cfg(test)]
