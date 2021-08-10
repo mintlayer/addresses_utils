@@ -1,42 +1,61 @@
 use crate::consts::*;
 use crate::hashing::sha2_256;
 use base58::*;
-use bech32_no_std::{self, FromBase32, ToBase32};
+use bech32_no_std::{self, u5, FromBase32, ToBase32};
 use blake2_rfc::blake2b::Blake2bResult;
 use ripemd160::{Digest, Ripemd160};
 
 // Bech32 types
+#[allow(dead_code)]
 pub enum PrefixBech32 {
     P2WPKH,
-    P2WSH,
     P2WPKHTestnet,
-    P2WSHTestnet,
+    P2WPKHMint,
+    P2WPKHMintTestnet,
+    // Bitcoin Script addresses doesn't support yet
+
+    //P2WSH,
+    //P2WSHTestnet,
 }
 
 // Legacy types
-pub enum PrefixP2PWKH {
+#[allow(dead_code)]
+pub enum PrefixLegacy {
     P2pkh,
     P2sh,
     P2pkhTestnet,
     P2shTestnet,
 }
 
-impl PrefixP2PWKH {
+impl PrefixLegacy {
     pub fn to_byte(&self) -> u8 {
         match self {
             // 1address - For standard bitcoin addresses
-            PrefixP2PWKH::P2pkh => 0x00u8,
+            PrefixLegacy::P2pkh => 0x00u8,
             // 3address - For sending to an address that requires multiple signatures (multisig)
-            PrefixP2PWKH::P2sh => 0x05u8,
+            PrefixLegacy::P2sh => 0x05u8,
             // (m/n)address
-            PrefixP2PWKH::P2pkhTestnet => 0x6Fu8,
+            PrefixLegacy::P2pkhTestnet => 0x6Fu8,
             // 2address
-            PrefixP2PWKH::P2shTestnet => 0xC4u8,
+            PrefixLegacy::P2shTestnet => 0xC4u8,
         }
     }
 }
 
-pub trait AddressHelper {
+pub fn hash160(data: &[u8]) -> Vec<u8> {
+    let sha256 = sha2_256(data);
+
+    // create a RIPEMD-160 hasher instance
+    let mut hasher = Ripemd160::new();
+
+    // process input message
+    hasher.update(&sha256[..]);
+    let hash160 = hasher.finalize();
+
+    hash160.to_vec()
+}
+
+pub trait AddressHelperBtc {
     // The public key is a hashed (sha256 -> Ripemd160) version of your public key.
     fn as_hash160(&self) -> Vec<u8>;
 
@@ -45,82 +64,34 @@ pub trait AddressHelper {
 
     fn as_legacy_checksum(&self) -> Vec<u8>;
 
-    fn to_legacy(&self, r#type: PrefixP2PWKH) -> String;
+    fn to_legacy(&self, r#type: PrefixLegacy) -> String;
 
     fn to_bech32(&self, r#type: PrefixBech32) -> Option<String>;
 
+    // Printable hash160
     fn pubkey_to_pkh(&self) -> Option<String>;
+}
 
-    // Ss58 Helper
+pub trait FromBtcAddress {
+    fn legacy_as_pkh(&self) -> Vec<u8>;
+    fn bech32_as_pkh(&self) -> Option<String>;
+}
+
+pub trait AddressHelperSs58 {
     fn as_ss58hash(&self) -> blake2_rfc::blake2b::Blake2bResult;
 
     fn to_ss58(&self, ss58_format: u16) -> Option<String>;
+
+    fn pubkey_to_pkh(&self) -> Option<String>;
 }
 
-impl AddressHelper for [u8] {
-    fn as_hash160(&self) -> Vec<u8> {
-        let sha256 = sha2_256(self);
+pub trait FromSs58Address {
+    fn from_ss58(&self) -> Option<(u16, Vec<u8>)>;
 
-        // create a RIPEMD-160 hasher instance
-        let mut hasher = Ripemd160::new();
+    fn ss58_as_pkh(&self) -> Option<String>;
+}
 
-        // process input message
-        hasher.update(&sha256[..]);
-        let hash160 = hasher.finalize();
-
-        hash160.to_vec()
-    }
-
-    fn as_doubled_sha256(&self) -> Vec<u8> {
-        let sha256 = sha2_256(self);
-        let sha256 = sha2_256(&sha256);
-        Vec::from(&sha256[..])
-    }
-
-    fn as_legacy_checksum(&self) -> Vec<u8> {
-        Vec::from(&self.as_doubled_sha256()[0..4])
-    }
-
-    fn to_legacy(&self, r#type: PrefixP2PWKH) -> String {
-        // create a RIPEMD-160 hasher instance
-        let mut body = self.as_hash160();
-
-        body.insert(0, r#type.to_byte());
-        let checksum = body.as_slice().as_legacy_checksum();
-        body.extend(checksum);
-
-        body.to_base58()
-    }
-
-    fn to_bech32(&self, r#type: PrefixBech32) -> Option<String> {
-        // There are many steps involved in it.
-        // hash160(publickey) which is ripemd160(sha256(publickey)).
-        // After that add 0 Uint8 to the output of bech32 words.
-        // Then using bech32 encode it with the prefix bc for bitcoin.
-
-        let mut body = self.as_hash160();
-
-        let hrp = match r#type {
-            PrefixBech32::P2WPKH | PrefixBech32::P2WSH => "bc",
-            PrefixBech32::P2WPKHTestnet | PrefixBech32::P2WSHTestnet => "bt",
-        };
-
-        match bech32_no_std::encode(hrp, body.as_slice().to_base32()) {
-            Ok(data) => {
-                let mut data = data.replacen("bc1", "bc1q", 1);
-                // Need to check checksum
-                data.truncate(data.len() - 12);
-                Some(data)
-            }
-            Err(_) => None,
-        }
-    }
-
-    fn pubkey_to_pkh(&self) -> Option<String> {
-        let hash160 = self.as_hash160();
-        Some(hex::encode(hash160.as_slice()))
-    }
-
+impl AddressHelperSs58 for [u8] {
     fn as_ss58hash(&self) -> Blake2bResult {
         // Checksum prefix
         const CHECKSUM_PREFIX: &[u8; 7] = b"SS58PRE";
@@ -147,7 +118,7 @@ impl AddressHelper for [u8] {
             }
             _ => {
                 if cfg!(test) {
-                    println!("masked out the upper two bits; qed");
+                    eprintln!("masked out the upper two bits; qed");
                 }
                 return None;
             }
@@ -157,13 +128,115 @@ impl AddressHelper for [u8] {
         v.extend(&r.as_bytes()[0..2]);
         Some(v.to_base58())
     }
+
+    fn pubkey_to_pkh(&self) -> Option<String> {
+        let hash160 = self.as_hash160();
+        Some(hex::encode(hash160.as_slice()))
+    }
 }
 
-trait FromSs58 {
-    fn from_ss58(&self) -> Option<(u16, Vec<u8>)>;
+impl AddressHelperBtc for [u8] {
+    // PubKEY HASH
+    fn as_hash160(&self) -> Vec<u8> {
+        hash160(self)
+    }
+
+    fn as_doubled_sha256(&self) -> Vec<u8> {
+        let sha256 = sha2_256(self);
+        let sha256 = sha2_256(&sha256);
+        Vec::from(&sha256[..])
+    }
+
+    fn as_legacy_checksum(&self) -> Vec<u8> {
+        Vec::from(&self.as_doubled_sha256()[0..4])
+    }
+
+    fn to_legacy(&self, r#type: PrefixLegacy) -> String {
+        // create a RIPEMD-160 hasher instance
+        let mut body = self.as_hash160();
+
+        body.insert(0, r#type.to_byte());
+        let checksum = body.as_slice().as_legacy_checksum();
+        body.extend(checksum);
+
+        body.to_base58()
+    }
+
+    fn to_bech32(&self, r#type: PrefixBech32) -> Option<String> {
+        // There are many steps involved in it.
+        // hash160(publickey) which is ripemd160(sha256(publickey)).
+        // After that add 0 Uint8 to the output of bech32 words.
+        // Then using bech32 encode it with the prefix bc for bitcoin.
+        let body = self.as_hash160();
+        let hrp = match r#type {
+            PrefixBech32::P2WPKH => "bc",
+            PrefixBech32::P2WPKHMint => HRP_MINT_MAINNET,
+            PrefixBech32::P2WPKHTestnet => "bt",
+            PrefixBech32::P2WPKHMintTestnet => HRP_MINT_TESTNET,
+        };
+
+        let mut body = body.as_slice().to_base32();
+        body.insert(0, u5::try_from_u8(0).ok()?);
+        let mut address = bech32_no_std::encode(hrp, body).ok()?;
+        address.truncate(address.len() - 6);
+        Some(address)
+    }
+
+    fn pubkey_to_pkh(&self) -> Option<String> {
+        let hash160 = self.as_hash160();
+        Some(hex::encode(hash160.as_slice()))
+    }
 }
 
-impl FromSs58 for &str {
+impl FromBtcAddress for &str {
+    fn legacy_as_pkh(&self) -> Vec<u8> {
+        // if self.len() < BECH32_P2WPKH.len() {
+        //     return None;
+        // }
+        // Some(addr[4..addr.len() - 6].to_string())
+        unimplemented!()
+    }
+
+    fn bech32_as_pkh(&self) -> Option<String> {
+        // Check address length (HRP - min 1 char, Separator = 1 char, data = 20 chars)
+        // Maximum size of Bech32 address is 90 chars
+        const MIN_P2WPKH_ADDRESS_LENGTH: usize = 22;
+        const MAX_P2WPKH_ADDRESS_LENGTH: usize = 90;
+
+        if (self.len() < MIN_P2WPKH_ADDRESS_LENGTH) || (self.len() > MAX_P2WPKH_ADDRESS_LENGTH) {
+            if cfg!(test) {
+                eprintln!("Invalid length of Bech32 address");
+            }
+            return None;
+        }
+
+        // Check BASE58 characters. It was helpful on debugging
+        const CHARSET: [char; 32] = [
+            'q', 'p', 'z', 'r', 'y', '9', 'x', '8', //  +0
+            'g', 'f', '2', 't', 'v', 'd', 'w', '0', //  +8
+            's', '3', 'j', 'n', '5', '4', 'k', 'h', // +16
+            'c', 'e', '6', 'm', 'u', 'a', '7', 'l', // +24
+        ];
+        let separator_position = match self.chars().position(|x| x == '1') {
+            Some(x) => x + 1,
+            None => 0,
+        };
+        let charset = CHARSET.to_vec();
+        for ch in self[separator_position..].chars() {
+            if charset.iter().find(|&&x| x == ch).is_none() {
+                if cfg!(test) {
+                    eprintln!("Invalid char: {} in Bech32 address data", ch);
+                }
+                return None;
+            }
+        }
+        let (_, data) = bech32_no_std::decode(&self).ok()?;
+        let data = Vec::<u8>::from_base32(&data[1..]).ok()?;
+        Some(hex::encode(data))
+    }
+}
+
+impl FromSs58Address for &str {
     fn from_ss58(&self) -> Option<(u16, Vec<u8>)> {
         // Decode string
         let dec_bytes = self.from_base58().ok()?;
@@ -184,7 +257,7 @@ impl FromSs58 for &str {
         };
         if dec_bytes.len() != prefix_len + SS58_DATA_BYTE_LEN + SS58_CHECKSUM_LEN {
             if cfg!(test) {
-                println!("Bad length {}", dec_bytes.len());
+                eprintln!("Bad length {}", dec_bytes.len());
             }
             return None;
         }
@@ -193,7 +266,7 @@ impl FromSs58 for &str {
         for i in SS58_RESERVED_FORMATS {
             if *i == ident.into() {
                 if cfg!(test) {
-                    println!("Invalid SS58 format {}", i);
+                    eprintln!("Invalid SS58 format {}", i);
                 }
                 return None;
             }
@@ -207,27 +280,24 @@ impl FromSs58 for &str {
         {
             // Invalid checksum.
             if cfg!(test) {
-                println!("Invalid checksum");
+                eprintln!("Invalid checksum");
             }
             return None;
         }
         let res: Vec<u8> = Vec::from(&dec_bytes[prefix_len..SS58_DATA_BYTE_LEN + prefix_len]);
         Some((ident, res))
     }
-}
 
-pub fn bech32_to_pkh(addr: &str) -> Option<String> {
-    if addr.len() < BECH32_P2WPKH.len() {
-        return None;
+    fn ss58_as_pkh(&self) -> Option<String> {
+        let (_format, pubkey) = self.from_ss58()?;
+        let hash160 = hash160(&pubkey);
+        Some(hex::encode(hash160.as_slice()))
     }
-    Some(addr[4..addr.len() - 6].to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consts::*;
-    use bech32_no_std::ToBase32;
 
     #[test]
     fn bech32_checksum() {
@@ -269,29 +339,57 @@ mod tests {
         assert_eq!(&test_hash160, hash160.as_slice());
     }
 
-    #[test]
-    fn bech32_to_pkh() {
-        assert_eq!(
-            super::bech32_to_pkh(BECH32_P2WPKH).unwrap(),
-            "2wzdwh9znl8jz306ncgagapmaevkqt68"
-        );
-    }
+    // #[test]
+    // fn bech32_to_pkh() {
+    //     assert_eq!(
+    //         BECH32_P2WPKH.legacy_as_pkh(),
+    //         "2wzdwh9znl8jz306ncgagapmaevkqt68"
+    //     );
+    // }
 
-    #[test]
-    fn legacy_encode_address() {
-        // 0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
-        // bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
-
-        println!("{}", hex::encode(&COMPRESSED_PUBKEY));
-        let address = &COMPRESSED_PUBKEY.to_legacy(PrefixP2PWKH::P2pkh);
-        assert_ne!(address, ""); // NEED TO CHANGE THE TEST DATA
-    }
+    // #[test]
+    // fn legacy_encode_address() {
+    //     // 0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+    //     // bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+    //
+    //     println!("{}", hex::encode(&COMPRESSED_PUBKEY));
+    //     let address = &COMPRESSED_PUBKEY.to_legacy(PrefixP2PWKH::P2pkh);
+    //     assert_ne!(address, ""); // NEED TO CHANGE THE TEST DATA
+    // }
 
     #[test]
     fn bech32_encode_address() {
-        println!("{}", hex::encode(&COMPRESSED_PUBKEY));
+        // Make main net P2WPKH address
         let address = &COMPRESSED_PUBKEY.to_bech32(PrefixBech32::P2WPKH).unwrap();
-        assert_eq!(address, BECH32_P2WPKH);
+        assert_eq!(BECH32_P2WPKH, address);
+
+        // Make test net P2WPKH address
+        let address = &COMPRESSED_PUBKEY
+            .to_bech32(PrefixBech32::P2WPKHTestnet)
+            .unwrap();
+        assert_eq!(BECH32_P2WPKH_TESTNET, address);
+
+        // Make Mintlayer main net P2WPKH address
+        let address = &COMPRESSED_PUBKEY
+            .to_bech32(PrefixBech32::P2WPKHMint)
+            .unwrap();
+        assert_eq!(BECH32_P2WPKH_MINT, address);
+
+        // Make Mintlayer test net P2WPKH address
+        let address = &COMPRESSED_PUBKEY
+            .to_bech32(PrefixBech32::P2WPKHMintTestnet)
+            .unwrap();
+        assert_eq!(BECH32_P2WPKH_MINTTESTNET, address);
+    }
+
+    #[test]
+    fn p2wpkh_take_pkh() {
+        assert_eq!(
+            // Let's take PKH from compressed pubkey
+            AddressHelperSs58::pubkey_to_pkh(&COMPRESSED_PUBKEY[..]).unwrap(),
+            // Let's take PKH from p2wpkh representation from address
+            BECH32_P2WPKH.bech32_as_pkh().unwrap()
+        );
     }
 
     #[test]
@@ -311,7 +409,6 @@ mod tests {
 
         // Check decoding function from the Compressed Pubkey to ss58 address
         let addr = &compressed_pubkey.to_ss58(format).unwrap();
-        println!("ss58 address from pubkey {:?}", addr);
         assert_eq!(addr, ss58_address);
     }
 
@@ -323,7 +420,7 @@ mod tests {
             0x96, 0x54, 0x9a, 0x87, 0x37,
         ];
         let pkh = "93ce48570b55c42c2af816aeaba06cfee1224fae";
-        let pkh_data = compressed_pubkey.pubkey_to_pkh().unwrap();
+        let pkh_data = super::AddressHelperSs58::pubkey_to_pkh(&compressed_pubkey[..]).unwrap();
         assert_eq!(pkh, pkh_data);
     }
 }
